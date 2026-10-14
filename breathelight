@@ -1,0 +1,253 @@
+`timescale 1ns / 1ps
+
+// =========================================================================
+// 總頂層模組 (Master Top Module) - 純結構化設計
+// =========================================================================
+module test #(
+    parameter PWM_RESOLUTION = 8,       // 決定亮度(PWM)解析度
+    parameter T_STEP_TICKS   = 100000   // 決定多久進行「一次的亮度變化」(Δt)
+)(
+    input  wire clk,
+    input  wire rst,  
+    
+    // 實體 RGB LED 輸出腳位
+    output wire led_r,
+    output wire led_g,
+    output wire led_b
+    
+    // VGA 輸出腳位
+   /* output wire [3:0] vga_r,
+    output wire [3:0] vga_g,
+    output wire [3:0] vga_b,
+    output wire hsync,
+    output wire vsync*/
+);
+
+    // =========================================================================
+    // 內部連線 (Wires) 宣告
+    // =========================================================================
+    wire step_en;
+    wire cycle_done;
+    wire [PWM_RESOLUTION-1:0] current_duty;
+    wire [PWM_RESOLUTION-1:0] max_r, max_g, max_b;
+
+    // =========================================================================
+    // 模組例化：呼吸燈核心區塊
+    // =========================================================================
+    delta_t_gen #(.T_STEP_TICKS(T_STEP_TICKS)) u_delta_t (
+        .clk(clk),
+        .rst_n(~rst), 
+        .step_en(step_en)
+    );
+
+    duty_cycle_ctrl #(.PWM_RESOLUTION(PWM_RESOLUTION)) u_duty_ctrl (
+        .clk(clk),
+        .rst_n(~rst),
+        .step_en(step_en),
+        .duty_cycle(current_duty),
+        .cycle_done(cycle_done)
+    );
+
+    breathing_color_sequencer #(.PWM_RESOLUTION(PWM_RESOLUTION)) u_color_seq (
+        .clk(clk),
+        .rst_n(~rst),
+        .cycle_done(cycle_done),
+        .max_r(max_r),
+        .max_g(max_g),
+        .max_b(max_b)
+    );
+
+    pwm_color_gen #(.PWM_RESOLUTION(PWM_RESOLUTION)) u_pwm_gen (
+        .clk(clk),
+        .rst_n(~rst),
+        .duty_cycle(current_duty),
+        .max_r(max_r),
+        .max_g(max_g),
+        .max_b(max_b),
+        .led_r(led_r),  // 直接將 PWM 訊號接至實體輸出的 LED 腳位
+        .led_g(led_g),
+        .led_b(led_b)
+    );
+
+    // =========================================================================
+    // 模組例化：VGA 顯示引擎
+    // 將實體的 LED 訊號同時餵給 VGA 螢幕，達成實體燈與螢幕同步發光
+    // =========================================================================
+    /*VGA u_vga (
+        .vga_r(vga_r),
+        .vga_g(vga_g),
+        .vga_b(vga_b),
+        .hsync(hsync),
+        .vsync(vsync),
+        .led({led_r, led_b, led_g}), // 同步接收 PWM 訊號
+        .clk(clk),
+        .rst(rst)
+    );*/
+
+endmodule
+
+
+// =========================================================================
+// 附屬子模組：呼吸燈顏色自動輪播機 (Red -> Green -> Blue)
+// =========================================================================
+module breathing_color_sequencer #(parameter PWM_RESOLUTION = 8)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire cycle_done,
+    output reg  [PWM_RESOLUTION-1:0] max_r,
+    output reg  [PWM_RESOLUTION-1:0] max_g,
+    output reg  [PWM_RESOLUTION-1:0] max_b
+);
+    reg [1:0] state;
+    localparam S_RED   = 2'd0;
+    localparam S_GREEN = 2'd1;
+    localparam S_BLUE  = 2'd2;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= S_RED;
+            max_r <= {PWM_RESOLUTION{1'b1}}; 
+            max_g <= {PWM_RESOLUTION{1'b0}};
+            max_b <= {PWM_RESOLUTION{1'b0}};
+        end else if (cycle_done) begin
+            case (state)
+                S_RED: begin
+                    state <= S_GREEN;
+                    max_r <= {PWM_RESOLUTION{1'b0}};
+                    max_g <= {PWM_RESOLUTION{1'b1}};
+                    max_b <= {PWM_RESOLUTION{1'b0}};
+                end
+                S_GREEN: begin
+                    state <= S_BLUE;
+                    max_r <= {PWM_RESOLUTION{1'b0}};
+                    max_g <= {PWM_RESOLUTION{1'b0}};
+                    max_b <= {PWM_RESOLUTION{1'b1}};
+                end
+                S_BLUE: begin
+                    state <= S_RED;
+                    max_r <= {PWM_RESOLUTION{1'b1}};
+                    max_g <= {PWM_RESOLUTION{1'b0}};
+                    max_b <= {PWM_RESOLUTION{1'b0}};
+                end
+                default: state <= S_RED;
+            endcase
+        end
+    end
+endmodule
+
+
+// =========================================================================
+// 附屬子模組：呼吸燈基礎控制 (Δt 產生、責任週期、PWM)
+// =========================================================================
+module delta_t_gen #(parameter T_STEP_TICKS = 100000)(
+    input  wire clk, rst_n,
+    output wire step_en
+);
+    reg [31:0] delta_t_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) delta_t_cnt <= 32'd0;
+        else if (delta_t_cnt >= T_STEP_TICKS - 1) delta_t_cnt <= 32'd0;
+        else delta_t_cnt <= delta_t_cnt + 32'd1;
+    end
+    assign step_en = (delta_t_cnt == T_STEP_TICKS - 1);
+endmodule
+
+module duty_cycle_ctrl #(parameter PWM_RESOLUTION = 8)(
+    input  wire clk, rst_n, step_en,
+    output reg  [7:0] duty_cycle,
+    output reg  cycle_done  
+);
+    reg fade_dir; 
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            duty_cycle <= {PWM_RESOLUTION{1'b0}};
+            fade_dir   <= 1'b0;
+            cycle_done <= 1'b0;
+        end else begin
+            cycle_done <= 1'b0; 
+            if (step_en) begin
+                if (fade_dir == 1'b0) begin 
+                    if (duty_cycle == {PWM_RESOLUTION{1'b1}} - 1) fade_dir <= 1'b1;
+                    duty_cycle <= duty_cycle + 1'b1;
+                end else begin              
+                    if (duty_cycle == 1) begin
+                        fade_dir   <= 1'b0;
+                        cycle_done <= 1'b1; 
+                    end
+                    duty_cycle <= duty_cycle - 1'b1;
+                end
+            end
+        end
+    end
+endmodule
+
+module pwm_color_gen #(parameter PWM_RESOLUTION = 8)(
+    input  wire clk, rst_n,
+    input  wire [PWM_RESOLUTION-1:0] duty_cycle, max_r, max_g, max_b,
+    output wire led_r, led_g, led_b
+);
+    wire [PWM_RESOLUTION*2-1:0] duty_r_mult = duty_cycle * max_r;
+    wire [PWM_RESOLUTION*2-1:0] duty_g_mult = duty_cycle * max_g;
+    wire [PWM_RESOLUTION*2-1:0] duty_b_mult = duty_cycle * max_b;
+
+    wire [PWM_RESOLUTION-1:0] target_r = duty_r_mult[PWM_RESOLUTION*2-1 : PWM_RESOLUTION];
+    wire [PWM_RESOLUTION-1:0] target_g = duty_g_mult[PWM_RESOLUTION*2-1 : PWM_RESOLUTION];
+    wire [PWM_RESOLUTION-1:0] target_b = duty_b_mult[PWM_RESOLUTION*2-1 : PWM_RESOLUTION];
+
+    reg [PWM_RESOLUTION-1:0] pwm_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) pwm_cnt <= {PWM_RESOLUTION{1'b0}};
+        else pwm_cnt <= pwm_cnt + 1'b1;
+    end
+
+    assign led_r = (pwm_cnt < target_r) ? 1'b1 : 1'b0;
+    assign led_g = (pwm_cnt < target_g) ? 1'b1 : 1'b0;
+    assign led_b = (pwm_cnt < target_b) ? 1'b1 : 1'b0;
+endmodule
+
+// =========================================================================
+// 附屬子模組：VGA 顯示引擎 (已修正支援純藍色顯示)
+// =========================================================================
+/*module VGA(vga_r,vga_g,vga_b,hsync,vsync,led,clk,rst);
+    output reg [3:0] vga_r,vga_g,vga_b;
+    output hsync,vsync;
+    input [2:0] led;
+    input clk,rst;
+
+    parameter H_SYNC = 96, H_SYNC_BACK_Porch = 48, H_SYNC_ADDRESSABLE_VIDEO = 640, H_SYNC_FRONT_PORCH = 16, H_SYNC_PERIOD = H_SYNC + H_SYNC_BACK_Porch + H_SYNC_ADDRESSABLE_VIDEO + H_SYNC_FRONT_PORCH;
+    parameter V_SYNC = 2, V_SYNC_BACK_Porch = 33, V_SYNC_ADDRESSABLE_VIDEO = 480, V_SYNC_FRONT_PORCH = 10, V_SYNC_PERIOD = V_SYNC + V_SYNC_BACK_Porch + V_SYNC_ADDRESSABLE_VIDEO + V_SYNC_FRONT_PORCH;
+
+    reg [9:0] h_counter,v_counter;
+    wire valid_flag;
+
+    always@(posedge clk or posedge rst)begin
+        if(rst) h_counter <= 10'd0;
+        else if(h_counter == H_SYNC_PERIOD-1) h_counter <= 10'd0;
+        else h_counter <= h_counter + 10'd1;
+    end
+
+    always@(posedge clk or posedge rst)begin
+        if(rst) v_counter <= 10'd0;
+        else if((v_counter == V_SYNC_PERIOD - 1) && (h_counter == H_SYNC_PERIOD-1)) v_counter <= 10'd0;
+        else if(h_counter == H_SYNC_PERIOD-1) v_counter <= v_counter + 10'd1;
+    end
+
+    assign hsync = (h_counter <= H_SYNC - 1'd1)?1'b1:1'b0;
+    assign vsync = (v_counter <= V_SYNC - 1'd1)?1'b1:1'b0;
+    assign valid_flag = (h_counter >= (H_SYNC + H_SYNC_BACK_Porch)) && (h_counter <= (H_SYNC + H_SYNC_BACK_Porch + H_SYNC_ADDRESSABLE_VIDEO)) && (v_counter >= (V_SYNC + V_SYNC_BACK_Porch)) && (v_counter <= (V_SYNC + V_SYNC_BACK_Porch + V_SYNC_ADDRESSABLE_VIDEO));
+
+    always@(posedge clk or posedge rst)begin
+        if(rst)begin
+            vga_r <= 4'h0; vga_g <= 4'h0; vga_b <= 4'h0;
+        end else if(valid_flag)begin
+            case(led)
+                3'b100:begin vga_r <= 4'hf; vga_g <= 4'h0; vga_b <= 4'h0; end // 紅色
+                3'b010:begin vga_r <= 4'h0; vga_g <= 4'h0; vga_b <= 4'hf; end // 藍色
+                3'b001:begin vga_r <= 4'h0; vga_g <= 4'hf; vga_b <= 4'h0; end // 綠色
+                default:begin vga_r <= 4'h0; vga_g <= 4'h0; vga_b <= 4'h0; end
+            endcase
+        end else begin
+            vga_r <= 4'h0; vga_g <= 4'h0; vga_b <= 4'h0;
+        end
+    end
+endmodule*/
