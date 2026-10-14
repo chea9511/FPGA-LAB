@@ -1,0 +1,242 @@
+`timescale 1ns / 1ps
+
+// =========================================================================
+// 總頂層模組 (Master Top Module) - 支援暫停與雙獨立速度控制
+// =========================================================================
+module test #(
+    parameter PWM_RESOLUTION = 8,       
+    parameter T_STEP_SLOW    = 100000,  // 慢速呼吸的計數值
+    parameter T_STEP_FAST    = 25000    // 快速呼吸的計數值
+)(
+    input  wire clk,
+    input  wire rst,  
+    
+    // 控制介面
+    input  wire btn_pause, // [新增] 按鈕：暫停/繼續 (Push Button)
+    input  wire sw_color,  // [新增] 開關：顏色交替速度 (Slide Switch) -> 1:快(1次換色), 0:慢(3次換色)
+    input  wire sw_breath, // [新增] 開關：漸亮漸暗速度 (Slide Switch) -> 1:快, 0:慢
+    
+    // 實體 RGB LED 輸出腳位
+    output wire led_r,
+    output wire led_g,
+    output wire led_b
+);
+
+    // =========================================================================
+    // 內部連線 (Wires) 宣告
+    // =========================================================================
+    wire is_paused;
+    wire step_en;
+    wire cycle_done;
+    wire [PWM_RESOLUTION-1:0] current_duty;
+    wire [PWM_RESOLUTION-1:0] max_r, max_g, max_b;
+    wire [31:0] current_breath_ticks; 
+
+    // 根據 sw_breath 決定目前的呼吸速度
+    assign current_breath_ticks = sw_breath ? T_STEP_FAST : T_STEP_SLOW;
+
+    // =========================================================================
+    // 模組例化：暫停按鈕防彈跳與狀態切換
+    // =========================================================================
+    pause_toggle_ctrl u_pause_ctrl (
+        .clk(clk),
+        .rst_n(~rst),
+        .btn(btn_pause),
+        .is_paused(is_paused)
+    );
+
+    // =========================================================================
+    // 模組例化：呼吸燈核心區塊
+    // =========================================================================
+    // 加入 pause 訊號，暫停時停止產生 step_en
+    delta_t_gen u_delta_t (
+        .clk(clk),
+        .rst_n(~rst), 
+        .pause(is_paused),
+        .target_ticks(current_breath_ticks),
+        .step_en(step_en)
+    );
+
+    duty_cycle_ctrl #(.PWM_RESOLUTION(PWM_RESOLUTION)) u_duty_ctrl (
+        .clk(clk),
+        .rst_n(~rst),
+        .step_en(step_en),
+        .duty_cycle(current_duty),
+        .cycle_done(cycle_done)
+    );
+
+    // 加入 sw_color 訊號，控制顏色交替邏輯
+    breathing_color_sequencer #(.PWM_RESOLUTION(PWM_RESOLUTION)) u_color_seq (
+        .clk(clk),
+        .rst_n(~rst),
+        .cycle_done(cycle_done),
+        .sw_color(sw_color),
+        .max_r(max_r),
+        .max_g(max_g),
+        .max_b(max_b)
+    );
+
+    pwm_color_gen #(.PWM_RESOLUTION(PWM_RESOLUTION)) u_pwm_gen (
+        .clk(clk),
+        .rst_n(~rst),
+        .duty_cycle(current_duty),
+        .max_r(max_r),
+        .max_g(max_g),
+        .max_b(max_b),
+        .led_r(led_r),  
+        .led_g(led_g),
+        .led_b(led_b)
+    );
+
+endmodule
+
+
+// =========================================================================
+// [新增子模組] 暫停按鈕防彈跳與狀態反轉器
+// 功能：按一下暫停，再按一下繼續
+// =========================================================================
+module pause_toggle_ctrl (
+    input  wire clk,
+    input  wire rst_n,
+    input  wire btn,
+    output reg  is_paused
+);
+    reg [15:0] db_cnt;
+    reg btn_stable, btn_prev;
+
+    // 防彈跳
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            db_cnt <= 16'd0;
+            btn_stable <= 1'b0;
+        end else begin
+            if (btn) begin
+                if (db_cnt == 16'hFFFF) btn_stable <= 1'b1;
+                else db_cnt <= db_cnt + 1'b1;
+            end else begin
+                db_cnt <= 16'd0;
+                btn_stable <= 1'b0;
+            end
+        end
+    end
+
+    // 狀態切換 (Toggle)
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            is_paused <= 1'b0;
+            btn_prev <= 1'b0;
+        end else begin
+            btn_prev <= btn_stable;
+            // 偵測到按下按鈕的瞬間
+            if (btn_stable && !btn_prev) begin
+                is_paused <= ~is_paused; 
+            end
+        end
+    end
+endmodule
+
+
+// =========================================================================
+// 附屬子模組：呼吸燈顏色自動輪播機 (含交替速度控制)
+// =========================================================================
+module breathing_color_sequencer #(parameter PWM_RESOLUTION = 8)(
+    input  wire clk, rst_n, cycle_done, sw_color,
+    output reg  [PWM_RESOLUTION-1:0] max_r, max_g, max_b
+);
+    reg [1:0] state;
+    reg [3:0] breath_cnt; 
+    
+    localparam S_RED = 2'd0, S_GREEN = 2'd1, S_BLUE = 2'd2;
+    
+    // 如果 sw_color=1 (快)，呼吸 1 次換色；如果 sw_color=0 (慢)，呼吸 3 次換色
+    wire [3:0] target_breaths = sw_color ? 4'd1 : 4'd3;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= S_RED;
+            breath_cnt <= 4'd0;
+            max_r <= {PWM_RESOLUTION{1'b1}}; max_g <= 0; max_b <= 0;
+        end else if (cycle_done) begin
+            // 判斷是否已經完成足夠的呼吸次數
+            if (breath_cnt >= target_breaths - 1) begin
+                breath_cnt <= 4'd0; // 計數器歸零，準備切換顏色
+                case (state)
+                    S_RED:   begin state <= S_GREEN; max_r <= 0; max_g <= {PWM_RESOLUTION{1'b1}}; max_b <= 0; end
+                    S_GREEN: begin state <= S_BLUE;  max_r <= 0; max_g <= 0; max_b <= {PWM_RESOLUTION{1'b1}}; end
+                    S_BLUE:  begin state <= S_RED;   max_r <= {PWM_RESOLUTION{1'b1}}; max_g <= 0; max_b <= 0; end
+                    default: state <= S_RED;
+                endcase
+            end else begin
+                // 還沒達到次數，繼續保持同一個顏色
+                breath_cnt <= breath_cnt + 1'b1;
+            end
+        end
+    end
+endmodule
+
+
+// =========================================================================
+// 附屬子模組：呼吸燈基礎控制 (Δt 產生、責任週期、PWM)
+// =========================================================================
+// [修改] delta_t_gen 支援 is_paused 凍結信號
+module delta_t_gen (
+    input  wire clk, rst_n, pause,
+    input  wire [31:0] target_ticks,
+    output wire step_en
+);
+    reg [31:0] delta_t_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) delta_t_cnt <= 32'd0;
+        else if (!pause) begin // 只有在沒被暫停時才計數
+            if (delta_t_cnt >= target_ticks - 1) delta_t_cnt <= 32'd0;
+            else delta_t_cnt <= delta_t_cnt + 32'd1;
+        end
+    end
+    
+    // 當達到目標且未暫停時，發出 step_en 脈波
+    assign step_en = (!pause) && (delta_t_cnt >= target_ticks - 1);
+endmodule
+
+module duty_cycle_ctrl #(parameter PWM_RESOLUTION = 8)(
+    input  wire clk, rst_n, step_en,
+    output reg  [PWM_RESOLUTION-1:0] duty_cycle, output reg cycle_done  
+);
+    reg fade_dir; 
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin duty_cycle <= 0; fade_dir <= 0; cycle_done <= 0; end 
+        else begin
+            cycle_done <= 0; 
+            if (step_en) begin
+                if (fade_dir == 0) begin 
+                    if (duty_cycle == {PWM_RESOLUTION{1'b1}} - 1) fade_dir <= 1;
+                    duty_cycle <= duty_cycle + 1;
+                end else begin              
+                    if (duty_cycle == 1) begin fade_dir <= 0; cycle_done <= 1; end
+                    duty_cycle <= duty_cycle - 1;
+                end
+            end
+        end
+    end
+endmodule
+
+module pwm_color_gen #(parameter PWM_RESOLUTION = 8)(
+    input  wire clk, rst_n,
+    input  wire [PWM_RESOLUTION-1:0] duty_cycle, max_r, max_g, max_b,
+    output wire led_r, led_g, led_b
+);
+    wire [PWM_RESOLUTION*2-1:0] duty_r_mult = duty_cycle * max_r;
+    wire [PWM_RESOLUTION*2-1:0] duty_g_mult = duty_cycle * max_g;
+    wire [PWM_RESOLUTION*2-1:0] duty_b_mult = duty_cycle * max_b;
+    wire [PWM_RESOLUTION-1:0] target_r = duty_r_mult[PWM_RESOLUTION*2-1 : PWM_RESOLUTION];
+    wire [PWM_RESOLUTION-1:0] target_g = duty_g_mult[PWM_RESOLUTION*2-1 : PWM_RESOLUTION];
+    wire [PWM_RESOLUTION-1:0] target_b = duty_b_mult[PWM_RESOLUTION*2-1 : PWM_RESOLUTION];
+    
+    reg [PWM_RESOLUTION-1:0] pwm_cnt;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) pwm_cnt <= 0; else pwm_cnt <= pwm_cnt + 1;
+    end
+    
+    assign led_r = (pwm_cnt < target_r) ? 1'b1 : 1'b0;
+    assign led_g = (pwm_cnt < target_g) ? 1'b1 : 1'b0;
+    assign led_b = (pwm_cnt < target_b) ? 1'b1 : 1'b0;
+endmodule
