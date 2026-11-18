@@ -1,0 +1,260 @@
+`timescale 1ns / 1ps
+
+// ==========================================
+// 1. 頂層模組 Top Module (Lab4_1)
+// ==========================================
+module Lab4_1 (
+    input wire clk,             // 系統預設時脈 (100MHz)
+    input wire rst,             // 系統重置 (BTNC)
+    input wire sw1,             // 玩家1按鍵 (左方 BTNL)
+    input wire sw2,             // 玩家2按鍵 (右方 BTNR)
+    input wire [1:0] speed_sw,  // 變速控制指撥開關 (SW3, SW2)
+    output wire [7:0] led       // 8顆 LED 顯示輸出
+);
+
+    wire clk_slow;              // 球移動用的慢速變速時脈
+    wire clk_blink;             // 遊戲結束閃爍用的固定時脈
+    wire sw1_pulse, sw2_pulse;  // 按鍵防彈跳後的單脈衝
+    wire [2:0] current_state;   // FSM 當前狀態
+    wire [3:0] score_p1;        // P1 分數
+    wire [3:0] score_p2;        // P2 分數
+
+    // 實體化除頻器 (控制球速與閃爍)
+    division_clock u_clk_div (
+        .clk(clk),
+        .rst(rst),
+        .speed_sw(speed_sw),
+        .pingpong_clk(clk_slow),
+        .blink_clk(clk_blink)
+    );
+
+    // 實體化左方按鍵防彈跳 (由 100MHz 高速時脈驅動，達成零延遲)
+    button_edge u_btn_sw1 (
+        .clk(clk), .rst(rst), .btn_in(sw1), .btn_pulse(sw1_pulse)
+    );
+
+    // 實體化右方按鍵防彈跳
+    button_edge u_btn_sw2 (
+        .clk(clk), .rst(rst), .btn_in(sw2), .btn_pulse(sw2_pulse)
+    );
+
+    // 實體化主狀態機 (100MHz 極速判定：提早按或漏接瞬間結算)
+    ping_pong_fsm u_fsm (
+        .clk(clk), .rst(rst),
+        .sw1(sw1_pulse), .sw2(sw2_pulse), .led_pos(led),       
+        .state_out(current_state), .score_p1(score_p1), .score_p2(score_p2)
+    );
+
+    // 實體化 LED 顯示控制器 (負責多工畫面顯示)
+    ball_shift u_ball (
+        .clk_slow(clk_slow), .clk_blink(clk_blink), .rst(rst),
+        .state_in(current_state), .score_p1(score_p1), .score_p2(score_p2),
+        .led_out(led)
+    );
+
+endmodule
+
+
+// ==========================================
+// 2. 動態變速除頻器 (100MHz 基準極限值)
+// ==========================================
+module division_clock (
+    input wire clk, 
+    input wire rst, 
+    input wire [1:0] speed_sw, 
+    output reg pingpong_clk, 
+    output wire blink_clk
+);
+    reg [26:0] cnt;
+    reg [26:0] current_limit;
+    reg [3:0] rand_cnt; 
+
+    // 勝利閃爍速度
+    assign blink_clk = cnt[22]; 
+
+    // 產生高速亂數 (50/100MHz 不斷跳動)
+    always @(posedge clk or posedge rst) begin
+        if (rst) rand_cnt <= 4'd0;
+        else rand_cnt <= rand_cnt + 4'd1;
+    end
+
+    // 安全的動態極限值除頻邏輯
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            cnt <= 27'd0;
+            pingpong_clk <= 1'b0;
+            current_limit <= 27'd25_000_000; 
+        end else if (cnt >= current_limit) begin
+            cnt <= 27'd0;
+            pingpong_clk <= ~pingpong_clk; 
+            
+            // 根據開關狀態決定下一步球速
+            case (speed_sw)
+                2'b00: current_limit <= 27'd25_000_000; // 慢速
+                2'b01: current_limit <= 27'd12_500_000; // 中速
+                2'b10: current_limit <= 27'd6_250_000;  // 快速
+                2'b11: begin // 亂數模式
+                    case (rand_cnt[3:2])
+                        2'b00: current_limit <= 27'd25_000_000;
+                        2'b01: current_limit <= 27'd12_500_000;
+                        default: current_limit <= 27'd6_250_000;
+                    endcase
+                end
+            endcase
+        end else begin
+            cnt <= cnt + 1'b1;
+        end
+    end
+endmodule
+
+
+// ==========================================
+// 3. 按鍵防彈跳與邊緣觸發
+// ==========================================
+module button_edge (
+    input wire clk, input wire rst, input wire btn_in, output wire btn_pulse
+);
+    reg btn_ff1, btn_ff2;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            btn_ff1 <= 1'b0; btn_ff2 <= 1'b0;
+        end else begin
+            btn_ff1 <= btn_in; btn_ff2 <= btn_ff1;
+        end
+    end
+    assign btn_pulse = btn_ff1 & (~btn_ff2); 
+endmodule
+
+
+// ==========================================
+// 4. 主狀態機 (嚴格最後一格判定 + 贏家發球)
+// ==========================================
+module ping_pong_fsm (
+    input wire clk, input wire rst,
+    input wire sw1, input wire sw2, input wire [7:0] led_pos, 
+    output reg [2:0] state_out, output reg [3:0] score_p1, output reg [3:0] score_p2
+);
+    localparam S_MOV_R       = 3'd0;
+    localparam S_MOV_L       = 3'd1;
+    localparam S_SHOW_SCORE  = 3'd2;
+    localparam S_WAIT_SERVE_L= 3'd3;
+    localparam S_WAIT_SERVE_R= 3'd4;
+    localparam S_GAME_OVER_L = 3'd5;
+    localparam S_GAME_OVER_R = 3'd6;
+
+    reg rand_bit;
+    always @(posedge clk or posedge rst) begin
+        if (rst) rand_bit <= 1'b0;
+        else rand_bit <= ~rand_bit;
+    end
+
+    reg winner_is_p1; 
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state_out <= S_WAIT_SERVE_R;
+            score_p1 <= 4'd0; score_p2 <= 4'd0;
+            winner_is_p1 <= 1'b0;
+        end else begin
+            case (state_out)
+                S_MOV_R: begin // === 球往右飛 ===
+                    if (sw2) begin
+                        // 嚴格版：必須在最後一格 (0000_0001) 按下才算回擊
+                        if (led_pos == 8'b0000_0001) 
+                            state_out <= S_MOV_L; 
+                        else begin // 提早按，瞬間凍結並計分
+                            score_p1 <= score_p1 + 4'd1;
+                            winner_is_p1 <= 1'b1; 
+                            if (score_p1 == 4'd7) state_out <= S_GAME_OVER_L; 
+                            else state_out <= S_SHOW_SCORE;
+                        end
+                    end else if (led_pos == 8'b0000_0000) begin // 漏接太晚按
+                        score_p1 <= score_p1 + 4'd1;
+                        winner_is_p1 <= 1'b1; 
+                        if (score_p1 == 4'd7) state_out <= S_GAME_OVER_L;
+                        else state_out <= S_SHOW_SCORE;
+                    end
+                end
+
+                S_MOV_L: begin // === 球往左飛 ===
+                    if (sw1) begin
+                        // 嚴格版：必須在最後一格 (1000_0000) 按下才算回擊
+                        if (led_pos == 8'b1000_0000) 
+                            state_out <= S_MOV_R; 
+                        else begin // 提早按，瞬間凍結並計分
+                            score_p2 <= score_p2 + 4'd1;
+                            winner_is_p1 <= 1'b0; 
+                            if (score_p2 == 4'd7) state_out <= S_GAME_OVER_R; 
+                            else state_out <= S_SHOW_SCORE;
+                        end
+                    end else if (led_pos == 8'b0000_0000) begin // 漏接太晚按
+                        score_p2 <= score_p2 + 4'd1;
+                        winner_is_p1 <= 1'b0;
+                        if (score_p2 == 4'd7) state_out <= S_GAME_OVER_R;
+                        else state_out <= S_SHOW_SCORE;
+                    end
+                end
+
+                S_SHOW_SCORE: begin // === 顯示分數，等待任一方確認 ===
+                    if (sw1 || sw2) begin
+                        if (winner_is_p1) state_out <= S_WAIT_SERVE_L; // 贏家發球
+                        else state_out <= S_WAIT_SERVE_R;
+                    end
+                end
+
+                S_WAIT_SERVE_L: if (sw1) state_out <= S_MOV_R;
+                S_WAIT_SERVE_R: if (sw2) state_out <= S_MOV_L;
+
+                S_GAME_OVER_L, S_GAME_OVER_R: begin // === 滿 8 分遊戲結束 ===
+                    if (sw1 || sw2) begin
+                        score_p1 <= 4'd0; score_p2 <= 4'd0;
+                        if (rand_bit) state_out <= S_WAIT_SERVE_R; // 隨機發球
+                        else state_out <= S_WAIT_SERVE_L;
+                    end
+                end
+                default: state_out <= S_WAIT_SERVE_R;
+            endcase
+        end
+    end
+endmodule
+
+
+// ==========================================
+// 5. LED 顯示控制器 (畫面多工切換)
+// ==========================================
+module ball_shift (
+    input wire clk_slow, input wire clk_blink, input wire rst,
+    input wire [2:0] state_in, input wire [3:0] score_p1, input wire [3:0] score_p2,
+    output reg [7:0] led_out
+);
+    reg [7:0] shift_reg;
+
+    // 移位暫存器負責紀錄球的位置，遇到 S_MOV 狀態轉換時會自動反彈
+    always @(posedge clk_slow or posedge rst) begin
+        if (rst) begin
+            shift_reg <= 8'b0000_0001; 
+        end else begin
+            if (state_in == 3'd0)      shift_reg <= shift_reg >> 1; // 向右飛
+            else if (state_in == 3'd1) shift_reg <= shift_reg << 1; // 向左飛
+            else if (state_in == 3'd3) shift_reg <= 8'b1000_0000;   // 回到左側發球位
+            else if (state_in == 3'd4) shift_reg <= 8'b0000_0001;   // 回到右側發球位
+        end
+    end
+
+    // 根據狀態瞬間改變 LED 輸出畫面 (組合邏輯)
+    always @(*) begin
+        case (state_in)
+            3'd0, 3'd1: // 球移動中
+                led_out = shift_reg; 
+
+            3'd2: // S_SHOW_SCORE: 左右兩側各三顆燈顯示分數 (高低位反轉對應視角)
+                led_out = {score_p1[0], score_p1[1], score_p1[2], 2'b00, score_p2[0], score_p2[1], score_p2[2]}; 
+                
+            3'd3: led_out = 8'b1000_0000; // 等待 P1 發球
+            3'd4: led_out = 8'b0000_0001; // 等待 P2 發球
+            3'd5: led_out = clk_blink ? 8'b1111_0000 : 8'b0000_0000; // P1 獲勝，左半邊閃爍
+            3'd6: led_out = clk_blink ? 8'b0000_1111 : 8'b0000_0000; // P2 獲勝，右半邊閃爍
+            default: led_out = 8'b0000_0000;
+        endcase
+    end
+endmodule
