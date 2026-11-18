@@ -1,0 +1,189 @@
+module HW3_vga (
+    input clk,          // 25MHz VGA clock
+    input rst,
+    input btn_change,   // 切換圖形的按鈕
+    output hsync,
+    output vsync,
+    output [3:0] vga_r,
+    output [3:0] vga_g,
+    output [3:0] vga_b
+);
+
+    wire [1:0] mode_wire;
+    wire [9:0] x_pos_wire;
+    wire [9:0] y_pos_wire;
+    wire video_on_wire;
+	wire w_vgaclk;
+
+    // 呼叫按鈕控制模組
+    button_ctrl u_btn_ctrl (
+        .clk(clk),
+        .rst(rst),
+        .btn_change(btn_change),
+        .mode(mode_wire)
+    );
+
+    // 呼叫 VGA 時序模組
+    vga_sync u_vga_sync (
+        .clk(w_vgaclk),
+        .rst(rst),
+        .hsync(hsync),
+        .vsync(vsync),
+        .x_pos(x_pos_wire),
+        .y_pos(y_pos_wire),
+        .video_on(video_on_wire)
+    );
+
+    // 呼叫圖形與顏色產生模組
+    pattern_gen u_pattern_gen (
+        .clk(clk),
+        .rst(rst),
+        .video_on(video_on_wire),
+        .x_pos(x_pos_wire),
+        .y_pos(y_pos_wire),
+        .mode(mode_wire),
+        .vga_r(vga_r),
+        .vga_g(vga_g),
+        .vga_b(vga_b)
+    );
+
+	division_clock U0(.vga_clk(w_vgaclk),.clk(clk),.rst(rst));
+endmodule
+
+module button_ctrl (
+    input clk,
+    input rst,
+    input btn_change,
+    output reg [1:0] mode
+);
+    reg btn_q1, btn_q2;
+    wire btn_rise;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            btn_q1 <= 0;
+            btn_q2 <= 0;
+        end else begin
+            btn_q1 <= btn_change;
+            btn_q2 <= btn_q1;
+        end
+    end
+    
+    assign btn_rise = btn_q1 & ~btn_q2;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) mode <= 2'd0;
+        else if (btn_rise) mode <= mode + 1'b1;
+    end
+endmodule
+
+module vga_sync(
+    input clk, 
+    input rst,
+    output hsync, 
+    output vsync,
+    output [9:0] x_pos, 
+    output [9:0] y_pos,
+    output video_on
+);
+    parameter H_SYNC = 96, H_BACK = 48, H_DISP = 640, H_FRONT = 16, H_TOTAL = 800;
+    parameter V_SYNC = 2,  V_BACK = 33, V_DISP = 480, V_FRONT = 10, V_TOTAL = 525;
+
+    reg [9:0] h_counter, v_counter;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) h_counter <= 10'd0;
+        else if (h_counter == H_TOTAL - 1) h_counter <= 10'd0;
+        else h_counter <= h_counter + 10'd1;
+    end
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) v_counter <= 10'd0;
+        else if (h_counter == H_TOTAL - 1) begin
+            if (v_counter == V_TOTAL - 1) v_counter <= 10'd0;
+            else v_counter <= v_counter + 10'd1;
+        end
+    end
+
+    assign hsync = (h_counter >= H_SYNC);
+    assign vsync = (v_counter >= V_SYNC);
+
+    assign video_on = (h_counter >= (H_SYNC + H_BACK)) && 
+                      (h_counter < (H_SYNC + H_BACK + H_DISP)) &&
+                      (v_counter >= (V_SYNC + V_BACK)) && 
+                      (v_counter < (V_SYNC + V_BACK + V_DISP));
+
+    assign x_pos = (video_on) ? (h_counter - (H_SYNC + H_BACK)) : 10'd0;
+    assign y_pos = (video_on) ? (v_counter - (V_SYNC + V_BACK)) : 10'd0;
+
+endmodule
+
+module pattern_gen (
+    input clk,
+    input rst,
+    input video_on,
+    input [9:0] x_pos,
+    input [9:0] y_pos,
+    input [1:0] mode,
+    output reg [3:0] vga_r,
+    output reg [3:0] vga_g,
+    output reg [3:0] vga_b
+);
+    // 中心點 (320, 240) 的距離計算
+    wire [9:0] dx = (x_pos > 320) ? (x_pos - 320) : (320 - x_pos);
+    wire [9:0] dy = (y_pos > 240) ? (y_pos - 240) : (240 - y_pos);
+    
+    // 圖形邊界條件判斷
+    wire is_circle = ((dx * dx) + (dy * dy) <= 10000); // 半徑 100
+    wire is_triangle = (y_pos >= 140) && (y_pos <= 340) && (dx <= (y_pos - 140));
+    wire is_hexagon = (dx <= 100) && (dy <= 86) && ((86 * dx + 50 * dy) <= 8600);
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            {vga_r, vga_g, vga_b} <= 12'h000;
+        end else if (video_on) begin
+            case (mode)
+                2'd0: begin // 圖形1: 七色均衡排開
+                    if      (x_pos < 91)  {vga_r, vga_g, vga_b} <= 12'hf00;
+                    else if (x_pos < 182) {vga_r, vga_g, vga_b} <= 12'hf80;
+                    else if (x_pos < 274) {vga_r, vga_g, vga_b} <= 12'hff0;
+                    else if (x_pos < 365) {vga_r, vga_g, vga_b} <= 12'h0f0;
+                    else if (x_pos < 457) {vga_r, vga_g, vga_b} <= 12'h00f;
+                    else if (x_pos < 548) {vga_r, vga_g, vga_b} <= 12'h408;
+                    else                  {vga_r, vga_g, vga_b} <= 12'h80f;
+                end
+                2'd1: begin // 圖形2: 底黑，中間紅圓形
+                    if (is_circle) {vga_r, vga_g, vga_b} <= 12'hf00;
+                    else           {vga_r, vga_g, vga_b} <= 12'h000;
+                end
+                2'd2: begin // 圖形3: 底黑，中間綠三角形
+                    if (is_triangle) {vga_r, vga_g, vga_b} <= 12'h0f0;
+                    else             {vga_r, vga_g, vga_b} <= 12'h000;
+                end
+                2'd3: begin // 圖形4: 底黑，中間藍六邊形
+                    if (is_hexagon) {vga_r, vga_g, vga_b} <= 12'h00f;
+                    else            {vga_r, vga_g, vga_b} <= 12'h000;
+                end
+            endcase
+        end else begin
+            {vga_r, vga_g, vga_b} <= 12'h000;
+        end
+    end
+endmodule
+
+module division_clock(vga_clk, clk, rst);
+    output vga_clk;
+    input clk, rst;
+    
+    reg [27:0] cnt;
+    
+    assign vga_clk = cnt[1];
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            cnt <= 28'd0;
+        end
+        else begin
+            cnt <= cnt + 28'd1;
+        end
+    end
+endmodule
