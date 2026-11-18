@@ -1,0 +1,47 @@
+`timescale 1ns / 1ps
+
+module count (
+    input wire clk,
+    input wire rst,        // 低態有效重置
+    output reg [3:0] count1,
+    output reg [7:0] count2
+);
+
+    localparam ST_RUN_COUNT1 = 1'b0;
+    localparam ST_RUN_COUNT2 = 1'b1;
+
+    reg current_state;
+
+    always @(posedge clk or negedge rst) begin
+        if (!rst) begin
+            current_state <= ST_RUN_COUNT1;
+            count1        <= 4'd0;
+            count2        <= 8'd253; // 也可以直接寫 8'd253 或 8'b11111101
+        end else begin
+            case (current_state)
+                ST_RUN_COUNT1: begin
+                    count2 <= 8'd253; // 在跑 count1 時，count2 保持 253
+                    
+                    if (count1 < 4'd9) begin
+                        count1 <= count1 + 4'd1;
+                    end else begin
+                        count1        <= 4'd0;
+                        current_state <= ST_RUN_COUNT2; // 換 count2 開始倒數
+                    end
+                end
+
+                ST_RUN_COUNT2: begin
+                    count1 <= 4'd0; 
+                    
+                    if (count2 > 8'd17) begin
+                        count2 <= count2 - 8'd1; // 從 253 往下遞減
+                    end else begin
+                        count2        <= 8'd253; // 倒數到 17 結束後，重置回 253
+                        current_state <= ST_RUN_COUNT1; // 循環回 count1
+                    end
+                end
+            end case
+        end
+    end
+
+endmodule
